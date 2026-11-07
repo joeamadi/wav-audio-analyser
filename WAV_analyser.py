@@ -5,8 +5,13 @@ import argparse
 import math
 import wave
 import readline
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+from scipy.signal import spectrogram
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Optional, Tuple
 
 
 @dataclass
@@ -33,23 +38,53 @@ class WAVAnalysisResult:
 		}
 
 
+@dataclass(frozen=True)
+class WAVFileMetadata:
+	channel_count: int
+	sample_rate_hz: int
+	sample_width_bytes: int
+	frame_count: int
+
+
+class WAVFileValidator:
+	"""Validate shared WAV properties and return the file metadata."""
+
+	@staticmethod
+	def validate(wav_file: wave.Wave_read) -> WAVFileMetadata:
+		channel_count = wav_file.getnchannels()
+		sample_rate_hz = wav_file.getframerate()
+		sample_width_bytes = wav_file.getsampwidth()
+
+		if sample_rate_hz <= 0:
+			raise ValueError("WAV sample rate must be greater than 0 Hz")
+		if channel_count <= 0:
+			raise ValueError("WAV file must have at least one channel")
+		if wav_file.getcomptype() != "NONE":
+			raise ValueError("Only uncompressed PCM WAV files are supported")
+		if sample_width_bytes not in (1, 2, 3, 4):
+			raise ValueError(
+				f"Unsupported PCM sample width: {sample_width_bytes} bytes"
+			)
+
+		return WAVFileMetadata(
+			channel_count=channel_count,
+			sample_rate_hz=sample_rate_hz,
+			sample_width_bytes=sample_width_bytes,
+			frame_count=wav_file.getnframes(),
+		)
+
+
 class WAVAnalyzer:
 	def __init__(self, filepath: str):
 		self.filepath = filepath
 
 	def analyze(self) -> WAVAnalysisResult:
 		with wave.open(self.filepath, "rb") as wav_file:
-			channels = wav_file.getnchannels()
-			sample_rate = wav_file.getframerate()
-			sample_width = wav_file.getsampwidth()
-			frame_count = wav_file.getnframes()
-
-			if sample_rate == 0:
-				raise ValueError("WAV sample rate must be greater than 0 Hz")
-			if wav_file.getcomptype() != "NONE":
-				raise ValueError("Only uncompressed PCM WAV files are supported")
-			if sample_width not in (1, 2, 3, 4):
-				raise ValueError(f"Unsupported PCM sample width: {sample_width} bytes")
+			metadata = WAVFileValidator.validate(wav_file)
+			channels = metadata.channel_count
+			sample_rate = metadata.sample_rate_hz
+			sample_width = metadata.sample_width_bytes
+			frame_count = metadata.frame_count
 
 			bit_depth = sample_width * 8
 			full_scale = 1 << (bit_depth - 1)
@@ -115,6 +150,102 @@ class WAVAnalyzer:
 		)
 
 
+class WAVSpectrogramGenerator:
+	"""Read a PCM WAV file and plot its mono spectrogram."""
+
+	def __init__(
+		self,
+		filepath: str,
+		segment_length: int = 1024,
+		overlap: Optional[int] = None,
+	):
+		if segment_length < 1:
+			raise ValueError("Segment length must be at least 1 sample")
+		if overlap is not None and not 0 <= overlap < segment_length:
+			raise ValueError("Overlap must be non-negative and less than segment length")
+
+		self.filepath = filepath
+		self.segment_length = segment_length
+		self.overlap = overlap
+
+	def generate(self	) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+		"""Return frequency bins, time bins, and power spectral density."""
+		with wave.open(self.filepath, "rb") as wav_file:
+			metadata = WAVFileValidator.validate(wav_file)
+			channel_count = metadata.channel_count
+			sample_rate = metadata.sample_rate_hz
+			sample_width = metadata.sample_width_bytes
+			frame_count = metadata.frame_count
+
+			if frame_count == 0:
+				raise ValueError("WAV file contains no audio samples")
+
+			audio_data = wav_file.readframes(frame_count)
+
+		bytes_per_frame = sample_width * channel_count
+		if len(audio_data) != frame_count * bytes_per_frame:
+			raise ValueError("WAV data does not match its declared frame count")
+		samples = self._decode_pcm(audio_data, sample_width)
+		full_scale = 1 << (sample_width * 8 - 1)
+		samples = samples.reshape(-1, channel_count).astype(np.float64) / full_scale
+		mono_signal = np.mean(samples, axis=1)
+
+		segment_length = min(self.segment_length, len(mono_signal))
+		overlap = self.overlap
+		if overlap is None:
+			overlap = segment_length // 2
+		else:
+			overlap = min(overlap, segment_length - 1)
+
+		frequencies, times, power = spectrogram(
+			mono_signal,
+			fs=sample_rate,
+			window="hann",
+			nperseg=segment_length,
+			noverlap=overlap,
+			scaling="density",
+			mode="psd",
+		)
+		return frequencies, times, power
+
+	@staticmethod
+	def _decode_pcm(audio_data: bytes, sample_width: int) -> np.ndarray:
+		if sample_width == 1:
+			return np.frombuffer(audio_data, dtype=np.uint8).astype(np.int16) - 128
+		if sample_width == 2:
+			return np.frombuffer(audio_data, dtype="<i2")
+		if sample_width == 3:
+			packed = np.frombuffer(audio_data, dtype=np.uint8).reshape(-1, 3)
+			samples = (
+				packed[:, 0].astype(np.int32)
+				| (packed[:, 1].astype(np.int32) << 8)
+				| (packed[:, 2].astype(np.int32) << 16)
+			)
+			return np.where(samples & 0x800000, samples - 0x1000000, samples)
+		return np.frombuffer(audio_data, dtype="<i4")
+
+	def plot(self) -> None:
+		"""Display the WAV file's power spectral density over time."""
+		frequencies, times, power = self.generate()
+		power_db = 10 * np.log10(np.maximum(power, np.finfo(float).tiny))
+		figure, axis = plt.subplots(figsize=(12, 6))
+		image = axis.pcolormesh(
+			times,
+			frequencies,
+			power_db,
+			shading="auto",
+			cmap="magma",
+		)
+		axis.set(
+			title=f"Spectrogram: {Path(self.filepath).name}",
+			xlabel="Time (seconds)",
+			ylabel="Frequency (Hz)",
+		)
+		figure.colorbar(image, ax=axis, label="Power spectral density (dB/Hz)")
+		figure.tight_layout()
+		plt.show()
+
+
 class WAVAnalysisReporter:
 	def print_results(self, results: WAVAnalysisResult):
 		print(f"Duration: {results.duration_seconds:.3f} seconds")
@@ -143,15 +274,19 @@ def main():
 		help="Path to the WAV file (prompted if omitted)",
 	)
 	args = parser.parse_args()
-	wav_file = args.wav_file or input("Enter the path to the WAV file: ").strip()
 
 	try:
+		wav_file = args.wav_file or input("Enter the path to the WAV file: ").strip()
 		results = WAVAnalyzer(wav_file).analyze()
 	except (OSError, EOFError, wave.Error, ValueError) as error:
 		print(f"Error: {error}")
 		return
 
 	WAVAnalysisReporter().print_results(results)
+	try:
+		WAVSpectrogramGenerator(wav_file).plot()
+	except (OSError, EOFError, wave.Error, ValueError) as error:
+		print(f"Error generating spectrogram: {error}")
 
 
 if __name__ == "__main__":
