@@ -5,6 +5,7 @@ import argparse
 import math
 import wave
 import readline
+import sqlite3
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -36,6 +37,86 @@ class WAVAnalysisResult:
 			"channel_peak_levels_dbfs": self.channel_peak_levels_dbfs,
 			"channel_rms_levels_dbfs": self.channel_rms_levels_dbfs,
 		}
+
+
+class SQLiteWAVAnalysisWriter:
+	"""Persist WAV analysis results and per-channel levels in SQLite."""
+
+	def __init__(self, database_path: str | Path):
+		self.database_path = str(Path(database_path).expanduser().resolve())
+
+	def write(self, filepath: str | Path, results: WAVAnalysisResult) -> None:
+		connection = sqlite3.connect(self.database_path)
+		try:
+			with connection:
+				connection.execute("PRAGMA foreign_keys = ON")
+				connection.execute(
+					"""
+					CREATE TABLE IF NOT EXISTS wav_analysis (
+						id INTEGER PRIMARY KEY AUTOINCREMENT,
+						filepath TEXT NOT NULL,
+						duration_seconds REAL NOT NULL,
+						sample_rate_hz INTEGER NOT NULL,
+						bit_depth INTEGER NOT NULL,
+						channel_count INTEGER NOT NULL,
+						peak_level_dbfs REAL NOT NULL,
+						rms_level_dbfs REAL NOT NULL,
+						analyzed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+					)
+					"""
+				)
+				connection.execute(
+					"""
+					CREATE TABLE IF NOT EXISTS wav_analysis_channels (
+						analysis_id INTEGER NOT NULL,
+						channel_number INTEGER NOT NULL,
+						peak_level_dbfs REAL NOT NULL,
+						rms_level_dbfs REAL NOT NULL,
+						PRIMARY KEY (analysis_id, channel_number),
+						FOREIGN KEY (analysis_id) REFERENCES wav_analysis(id)
+							ON DELETE CASCADE
+					)
+					"""
+				)
+				cursor = connection.execute(
+					"""
+					INSERT INTO wav_analysis (
+						filepath, duration_seconds, sample_rate_hz, bit_depth,
+						channel_count, peak_level_dbfs, rms_level_dbfs
+					) VALUES (?, ?, ?, ?, ?, ?, ?)
+					""",
+					(
+						str(Path(filepath).expanduser().resolve()),
+						results.duration_seconds,
+						results.sample_rate_hz,
+						results.bit_depth,
+						results.channel_count,
+						results.peak_level_dbfs,
+						results.rms_level_dbfs,
+					),
+				)
+				analysis_id = cursor.lastrowid
+				if analysis_id is None:
+					raise sqlite3.DatabaseError("Could not retrieve inserted analysis ID")
+				connection.executemany(
+					"""
+					INSERT INTO wav_analysis_channels (
+						analysis_id, channel_number, peak_level_dbfs, rms_level_dbfs
+					) VALUES (?, ?, ?, ?)
+					""",
+					(
+						(analysis_id, channel, peak, rms)
+						for channel, (peak, rms) in enumerate(
+							zip(
+								results.channel_peak_levels_dbfs,
+								results.channel_rms_levels_dbfs,
+							),
+							start=1,
+						)
+					),
+				)
+		finally:
+			connection.close()
 
 
 @dataclass(frozen=True)
@@ -267,26 +348,66 @@ class WAVAnalysisReporter:
 
 
 def main():
-	parser = argparse.ArgumentParser(description="Analyze a PCM WAV file")
+	parser = argparse.ArgumentParser(
+		description="Analyze a PCM WAV file or all WAV files in a folder"
+	)
 	parser.add_argument(
-		"wav_file",
+		"path",
 		nargs="?",
-		help="Path to the WAV file (prompted if omitted)",
+		help="Path to a WAV file or folder (prompted if omitted)",
+	)
+	parser.add_argument(
+		"--database",
+		default="wav_analysis.db",
+		help="SQLite database path (default: wav_analysis.db)",
 	)
 	args = parser.parse_args()
 
 	try:
-		wav_file = args.wav_file or input("Enter the path to the WAV file: ").strip()
-		results = WAVAnalyzer(wav_file).analyze()
-	except (OSError, EOFError, wave.Error, ValueError) as error:
+		path_text = args.path or input(
+			"Enter the path to a WAV file or folder: "
+		).strip()
+		if not path_text:
+			print("Error: a WAV file or folder path is required")
+			return
+		input_path = Path(path_text).expanduser()
+		is_directory = input_path.is_dir()
+		if is_directory:
+			wav_files = sorted(
+				(
+					path
+					for path in input_path.iterdir()
+					if path.is_file() and path.suffix.lower() == ".wav"
+				),
+				key=lambda path: path.name.lower(),
+			)
+		else:
+			wav_files = [input_path]
+	except (OSError, EOFError) as error:
 		print(f"Error: {error}")
 		return
 
-	WAVAnalysisReporter().print_results(results)
-	try:
-		WAVSpectrogramGenerator(wav_file).plot()
-	except (OSError, EOFError, wave.Error, ValueError) as error:
-		print(f"Error generating spectrogram: {error}")
+	if is_directory and not wav_files:
+		print(f"No WAV files found in folder: {input_path}")
+		return
+
+	database_writer = SQLiteWAVAnalysisWriter(args.database)
+	saved_results = False
+	for wav_file in wav_files:
+		try:
+			results = WAVAnalyzer(str(wav_file)).analyze()
+		except (OSError, wave.Error, ValueError) as error:
+			print(f"Error reading {wav_file}: {error}")
+			continue
+
+		try:
+			database_writer.write(wav_file, results)
+			saved_results = True
+		except sqlite3.Error as error:
+			print(f"Error saving analysis for {wav_file}: {error}")
+
+	if saved_results:
+		print(f"Results saved to: {database_writer.database_path}")
 
 
 if __name__ == "__main__":

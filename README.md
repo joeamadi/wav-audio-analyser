@@ -21,7 +21,13 @@ python -m pip install numpy matplotlib scipy
 
 ## Plot a WAV spectrogram
 
-Run `python WAV_analyser.py path/to/audio.wav` to report WAV analysis results
-and display a power spectrogram. If no path is supplied, the program prompts
-for one. Stereo channels are averaged to mono. The spectrogram uses
-1024-sample Hann windows with 50% overlap by default.
+Run `python WAV_analyser.py path/to/audio.wav` to analyze the WAV file and save
+the results to `wav_analysis.db`. You can also pass a folder to analyze every
+WAV file directly inside it (not including subfolders), for example
+`python WAV_analyser.py path/to/audio_folder`.
+If no path is supplied, the program prompts for a file or folder. Use
+`--database path/to/results.db` to choose another SQLite database. Aggregate
+results are stored in `wav_analysis`, with per-channel levels stored in
+`wav_analysis_channels`. The reporter and spectrogram classes are available for
+use directly, but the command-line entry point does not print results or show
+plots. After a successful save, it prints the full database location.

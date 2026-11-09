@@ -18,3 +18,8 @@ env/
 *.wav
 *.mp3
 *.flac
+
+# SQLite databases
+*.db
+*.sqlite
+*.sqlite3
